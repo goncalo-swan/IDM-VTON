@@ -32,19 +32,19 @@ from accelerate.utils import ProjectConfiguration, set_seed
 from packaging import version
 from torchvision import transforms
 import diffusers
-from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, StableDiffusionXLControlNetInpaintPipeline
+from diffusers import AutoencoderKL, EulerDiscreteScheduler, DDPMScheduler, StableDiffusionPipeline, StableDiffusionXLControlNetInpaintPipeline
 from transformers import AutoTokenizer, PretrainedConfig,CLIPImageProcessor, CLIPVisionModelWithProjection,CLIPTextModelWithProjection, CLIPTextModel, CLIPTokenizer
 
 from diffusers.utils.import_utils import is_xformers_available
 
 from src.unet_hacked_tryon import UNet2DConditionModel
 from src.unet_hacked_garmnet import UNet2DConditionModel as UNet2DConditionModel_ref
-from src.tryon_pipeline import StableDiffusionXLInpaintPipeline as TryonPipeline
 
-
+from src.kolors.models.modeling_chatglm import ChatGLMModel
+from src.kolors.models.tokenization_chatglm import ChatGLMTokenizer
+from src.kolors_hacked_pipeline import KolorsInpaintPipeline as TryonPipeline
 
 logger = get_logger(__name__, log_level="INFO")
-
 
 
 def parse_args():
@@ -151,7 +151,7 @@ class VitonHDTestDataset(data.Dataset):
         self.im_names = im_names
         self.c_names = c_names
         self.dataroot_names = dataroot_names
-        self.clip_processor = CLIPImageProcessor()
+        self.clip_processor = CLIPImageProcessor(size=336, crop_size=336)
     def __getitem__(self, index):
         c_name = self.c_names[index]
         im_name = self.im_names[index]
@@ -159,11 +159,18 @@ class VitonHDTestDataset(data.Dataset):
             cloth_annotation = self.annotation_pair[c_name]
         else:
             cloth_annotation = "shirts"
-        cloth = Image.open(os.path.join(self.dataroot, self.phase, "cloth", c_name))
 
-        im_pil_big = Image.open(
-            os.path.join(self.dataroot, self.phase, "image", im_name)
-        ).resize((self.width,self.height))
+        try:
+            cloth = Image.open(os.path.join(self.dataroot, self.phase, "cloth", c_name))
+        except FileNotFoundError:
+            return np.zeros(0)
+
+        try:
+            im_pil_big = Image.open(
+                os.path.join(self.dataroot, self.phase, "image", im_name)
+            ).resize((self.width,self.height))
+        except FileNotFoundError:
+            return np.zeros(0)
         image = self.transform(im_pil_big)
 
         mask = Image.open(os.path.join(self.dataroot, self.phase, "agnostic-mask", im_name.replace('.jpg','_mask.png'))).resize((self.width,self.height))
@@ -229,63 +236,49 @@ def main():
     #     args.mixed_precision = accelerator.mixed_precision
 
     # Load scheduler, tokenizer and models.
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-    vae = AutoencoderKL.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="vae",
-        torch_dtype=torch.float16,
-    )
-    unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="unet",
-        torch_dtype=torch.float16,
-    )
-    image_encoder = CLIPVisionModelWithProjection.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="image_encoder",
-        torch_dtype=torch.float16,
-    )
-    unet_encoder = UNet2DConditionModel_ref.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="unet_encoder",
-        torch_dtype=torch.float16,
-    )
-    text_encoder_one = CLIPTextModel.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="text_encoder",
-        torch_dtype=torch.float16,
-    )
-    text_encoder_two = CLIPTextModelWithProjection.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="text_encoder_2",
-        torch_dtype=torch.float16,
-    )
-    tokenizer_one = AutoTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="tokenizer",
-        revision=None,
-        use_fast=False,
-    )
-    tokenizer_two = AutoTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="tokenizer_2",
-        revision=None,
-        use_fast=False,
-    )
+    root_dir = "/home/swan/Desktop/goncalo/software/Kolors"
+    ckpt_dir = f'{root_dir}/weights/Kolors-Inpainting'
+    text_encoder = ChatGLMModel.from_pretrained(
+        f'{ckpt_dir}/text_encoder',
+        torch_dtype=torch.float16)
+    tokenizer = ChatGLMTokenizer.from_pretrained(f'{ckpt_dir}/text_encoder')
+    vae = AutoencoderKL.from_pretrained(f"{ckpt_dir}/vae", revision=None, torch_dtype=torch.float16)
+    scheduler = EulerDiscreteScheduler.from_pretrained(f"{ckpt_dir}/scheduler")
 
+    unet = UNet2DConditionModel.from_pretrained(
+        f"{ckpt_dir}/unet",
+        revision=None,
+        low_cpu_mem_usage=False,
+        device_map=None,
+        torch_dtype=torch.float16
+    )
+    # unet = UNet2DConditionModel.from_pretrained(
+    #     args.pretrained_model_name_or_path,
+    #     subfolder="unet",
+    #     torch_dtype=torch.float16,
+    # )
+    image_encoder = CLIPVisionModelWithProjection.from_pretrained(f'{root_dir}/weights/Kolors-IP-Adapter-Plus/image_encoder',  ignore_mismatched_sizes=True, torch_dtype=torch.float16)
+    # image_encoder = CLIPVisionModelWithProjection.from_pretrained(
+    #     args.pretrained_model_name_or_path,
+    #     subfolder="image_encoder",
+    #     torch_dtype=torch.float16,
+    # )
+    unet_encoder = UNet2DConditionModel_ref.from_pretrained(f"{ckpt_dir}/unet", revision=None, torch_dtype=torch.float16)
+    # unet_encoder = UNet2DConditionModel_ref.from_pretrained(
+    #     args.pretrained_model_name_or_path,
+    #     subfolder="unet_encoder",
+    #     torch_dtype=torch.float16,
+    # )
 
     # Freeze vae and text_encoder and set unet to trainable
     unet.requires_grad_(False)
     vae.requires_grad_(False)
     image_encoder.requires_grad_(False)
     unet_encoder.requires_grad_(False)
-    text_encoder_one.requires_grad_(False)
-    text_encoder_two.requires_grad_(False)
+    text_encoder.requires_grad_(False)
     unet_encoder.to(accelerator.device, weight_dtype)
     unet.eval()
     unet_encoder.eval()
-
-    
     
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -314,18 +307,16 @@ def main():
     )
 
     pipe = TryonPipeline.from_pretrained(
-            args.pretrained_model_name_or_path,
-            unet=unet,
-            vae=vae,
-            feature_extractor= CLIPImageProcessor(),
-            text_encoder = text_encoder_one,
-            text_encoder_2 = text_encoder_two,
-            tokenizer = tokenizer_one,
-            tokenizer_2 = tokenizer_two,
-            scheduler = noise_scheduler,
-            image_encoder=image_encoder,
-            unet_encoder = unet_encoder,
-            torch_dtype=torch.float16,
+        args.pretrained_model_name_or_path,
+        unet=unet,
+        vae=vae,
+        feature_extractor=CLIPImageProcessor(),
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        scheduler=scheduler,
+        image_encoder=image_encoder,
+        unet_encoder=unet_encoder,
+        torch_dtype=torch.float16,
     ).to(accelerator.device)
 
     # pipe.enable_sequential_cpu_offload()
@@ -342,10 +333,10 @@ def main():
                     img_emb_list = []
                     for i in range(sample['cloth'].shape[0]):
                         img_emb_list.append(sample['cloth'][i])
-                    
+
                     prompt = sample["caption"]
 
-                    num_prompts = sample['cloth'].shape[0]                                        
+                    num_prompts = sample['cloth'].shape[0]
                     negative_prompt = "monochrome, lowres, bad anatomy, worst quality, low quality"
 
                     if not isinstance(prompt, List):
@@ -354,6 +345,7 @@ def main():
                         negative_prompt = [negative_prompt] * num_prompts
 
                     image_embeds = torch.cat(img_emb_list,dim=0)
+                    print(image_embeds.shape)
 
                     with torch.inference_mode():
                         (
@@ -367,8 +359,8 @@ def main():
                             do_classifier_free_guidance=True,
                             negative_prompt=negative_prompt,
                         )
-                    
-                    
+
+
                         prompt = sample["caption_cloth"]
                         negative_prompt = "monochrome, lowres, bad anatomy, worst quality, low quality"
 
@@ -390,7 +382,7 @@ def main():
                                 do_classifier_free_guidance=False,
                                 negative_prompt=negative_prompt,
                             )
-                        
+
 
 
                         generator = torch.Generator(pipe.device).manual_seed(args.seed) if args.seed is not None else None
@@ -406,7 +398,7 @@ def main():
                             text_embeds_cloth=prompt_embeds_c,
                             cloth = sample["cloth_pure"].to(accelerator.device),
                             mask_image=sample['inpaint_mask'],
-                            image=(sample['image']+1.0)/2.0, 
+                            image=(sample['image']+1.0)/2.0,
                             height=args.height,
                             width=args.width,
                             guidance_scale=args.guidance_scale,
@@ -417,7 +409,7 @@ def main():
                     for i in range(len(images)):
                         x_sample = pil_to_tensor(images[i])
                         torchvision.utils.save_image(x_sample,os.path.join(args.output_dir,sample['im_name'][i]))
-                
+
 
 
 
