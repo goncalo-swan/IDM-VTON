@@ -237,45 +237,72 @@ def main():
 
     # Load scheduler, tokenizer and models.
     root_dir = "/home/swan/Desktop/goncalo/software/Kolors"
-    ckpt_dir = f'{root_dir}/weights/Kolors-Inpainting'
     text_encoder = ChatGLMModel.from_pretrained(
-        f'{ckpt_dir}/text_encoder',
+        f'{root_dir}/weights/Kolors-Inpainting/text_encoder',
         torch_dtype=torch.float16)
-    tokenizer = ChatGLMTokenizer.from_pretrained(f'{ckpt_dir}/text_encoder')
-    vae = AutoencoderKL.from_pretrained(f"{ckpt_dir}/vae", revision=None, torch_dtype=torch.float16)
-    scheduler = EulerDiscreteScheduler.from_pretrained(f"{ckpt_dir}/scheduler")
+    tokenizer = ChatGLMTokenizer.from_pretrained(f'{root_dir}/weights/Kolors-Inpainting/text_encoder')
+    vae = AutoencoderKL.from_pretrained(f"{root_dir}/weights/Kolors-Inpainting", revision=None, torch_dtype=torch.float16)
+    scheduler = EulerDiscreteScheduler.from_pretrained(f"{root_dir}/weights/Kolors-Inpainting/scheduler")
 
-    unet = UNet2DConditionModel.from_pretrained(
-        f"{ckpt_dir}/unet_hacked",
-        revision=None,
-        low_cpu_mem_usage=False,
-        device_map=None,
+    image_encoder = CLIPVisionModelWithProjection.from_pretrained(
+        f'{root_dir}/weights/Kolors-IP-Adapter-Plus/image_encoder',
         ignore_mismatched_sizes=True,
         torch_dtype=torch.float16
     )
-    # unet = UNet2DConditionModel.from_pretrained(
-    #     args.pretrained_model_name_or_path,
-    #     subfolder="unet",
-    #     torch_dtype=torch.float16,
-    # )
-    image_encoder = CLIPVisionModelWithProjection.from_pretrained(f'{root_dir}/weights/Kolors-IP-Adapter-Plus/image_encoder',  ignore_mismatched_sizes=True, torch_dtype=torch.float16)
-    # image_encoder = CLIPVisionModelWithProjection.from_pretrained(
-    #     args.pretrained_model_name_or_path,
-    #     subfolder="image_encoder",
-    #     torch_dtype=torch.float16,
-    # )
     unet_encoder = UNet2DConditionModel_ref.from_pretrained(
-        f"{ckpt_dir}/unet_encoder_hacked",
+        f"{root_dir}/weights/Kolors/unet_encoder",
         revision=None,
+        torch_dtype=torch.float16
+    )
+    unet = UNet2DConditionModel.from_pretrained(
+        f"{root_dir}/weights/Kolors-Inpainting/unet",
         low_cpu_mem_usage=False,
         device_map=None,
-        ignore_mismatched_sizes=True,
-        torch_dtype=torch.float16)
-    # unet_encoder = UNet2DConditionModel_ref.from_pretrained(
-    #     args.pretrained_model_name_or_path,
-    #     subfolder="unet_encoder",
-    #     torch_dtype=torch.float16,
-    # )
+        revision=None,
+        torch_dtype=torch.float16
+    )
+    unet.config.encoder_hid_dim = image_encoder.config.hidden_size
+    unet.config.encoder_hid_dim_type = "ip_image_proj"
+    unet.config["encoder_hid_dim"] = image_encoder.config.hidden_size
+    unet.config["encoder_hid_dim_type"] = "ip_image_proj"
+    state_dict = torch.load('ckpt/ip_adapter/ip-adapter-plus_sdxl_vit-h.bin', map_location="cpu")
+
+    adapter_modules = torch.nn.ModuleList(unet.attn_processors.values())
+    adapter_modules.load_state_dict(state_dict["ip_adapter"], strict=True)
+
+    # ip-adapter
+    image_proj_model = Resampler(
+        dim=image_encoder.config.hidden_size,
+        depth=4,
+        dim_head=64,
+        heads=20,
+        num_queries=16,
+        embedding_dim=image_encoder.config.hidden_size,
+        output_dim=unet.config.cross_attention_dim,
+        ff_mult=4,
+    ).to(accelerator.device, dtype=torch.float32)
+
+    #image_proj_model.load_state_dict(state_dict["image_proj"], strict=True)
+    image_proj_model.requires_grad_(True)
+
+    unet.encoder_hid_proj = image_proj_model
+
+    conv_new = torch.nn.Conv2d(
+        in_channels=4 + 4 + 1 + 4,
+        out_channels=unet.conv_in.out_channels,
+        kernel_size=3,
+        padding=1,
+    )
+    torch.nn.init.kaiming_normal_(conv_new.weight)
+    conv_new.weight.data = conv_new.weight.data * 0.
+
+    conv_new.weight.data[:, :9] = unet.conv_in.weight.data
+    conv_new.bias.data = unet.conv_in.bias.data
+
+    unet.conv_in = conv_new  # replace conv layer in unet
+    unet.config['in_channels'] = 13  # update config
+    unet.config.in_channels = 13  # update config
+    # customize unet end
 
     # Freeze vae and text_encoder and set unet to trainable
     unet.requires_grad_(False)

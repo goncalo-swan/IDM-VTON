@@ -417,6 +417,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
         self.conv_in = nn.Conv2d(
             in_channels, block_out_channels[0], kernel_size=conv_in_kernel, padding=conv_in_padding
         )
+        self.downsize_prompt = nn.Linear(encoder_hid_dim, cross_attention_dim)
 
         # time
         if time_embedding_type == "fourier":
@@ -1240,6 +1241,7 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
             image_embeds = added_cond_kwargs.get("image_embeds")
             # print(image_embeds.shape)
             # image_embeds = self.encoder_hid_proj(image_embeds).to(encoder_hidden_states.dtype)
+            encoder_hidden_states = self.downsize_prompt(encoder_hidden_states)
             encoder_hidden_states = torch.cat([encoder_hidden_states, image_embeds], dim=1)
 
         # 2. pre-process
