@@ -465,9 +465,6 @@ class StableDiffusionXLInpaintPipeline(
 
         image = image.to(device=device, dtype=dtype)
         if output_hidden_states:
-            print(self.image_encoder.config)
-            print(image.shape)
-
             image_enc_hidden_states = self.image_encoder(image, output_hidden_states=True).hidden_states[-2]
             image_enc_hidden_states = image_enc_hidden_states.repeat_interleave(num_images_per_prompt, dim=0)
             uncond_image_enc_hidden_states = self.image_encoder(
@@ -1046,14 +1043,10 @@ class StableDiffusionXLInpaintPipeline(
             add_time_ids = list(original_size + crops_coords_top_left + target_size)
             add_neg_time_ids = list(negative_original_size + crops_coords_top_left + negative_target_size)
 
-        print(self.unet.config.addition_time_embed_dim)
-        print(len(add_time_ids))
-        print(text_encoder_projection_dim)
         passed_add_embed_dim = (
             self.unet.config.addition_time_embed_dim * len(add_time_ids) + text_encoder_projection_dim
         )
         expected_add_embed_dim = self.unet.add_embedding.linear_1.in_features
-        print(expected_add_embed_dim)
 
         if (
             expected_add_embed_dim > passed_add_embed_dim
@@ -1728,10 +1721,6 @@ class StableDiffusionXLInpaintPipeline(
             image_embeds = self.prepare_ip_adapter_image_embeds(
                 ip_adapter_image, device, batch_size * num_images_per_prompt
             )
-
-
-            print(image_embeds.shape)
-            print(self.unet.config)
             #project outside for loop
             image_embeds = self.unet.encoder_hid_proj(image_embeds).to(prompt_embeds.dtype)
 

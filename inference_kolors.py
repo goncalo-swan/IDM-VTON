@@ -246,10 +246,11 @@ def main():
     scheduler = EulerDiscreteScheduler.from_pretrained(f"{ckpt_dir}/scheduler")
 
     unet = UNet2DConditionModel.from_pretrained(
-        f"{ckpt_dir}/unet",
+        f"{ckpt_dir}/unet_hacked",
         revision=None,
         low_cpu_mem_usage=False,
         device_map=None,
+        ignore_mismatched_sizes=True,
         torch_dtype=torch.float16
     )
     # unet = UNet2DConditionModel.from_pretrained(
@@ -263,7 +264,13 @@ def main():
     #     subfolder="image_encoder",
     #     torch_dtype=torch.float16,
     # )
-    unet_encoder = UNet2DConditionModel_ref.from_pretrained(f"{ckpt_dir}/unet", revision=None, torch_dtype=torch.float16)
+    unet_encoder = UNet2DConditionModel_ref.from_pretrained(
+        f"{ckpt_dir}/unet_encoder_hacked",
+        revision=None,
+        low_cpu_mem_usage=False,
+        device_map=None,
+        ignore_mismatched_sizes=True,
+        torch_dtype=torch.float16)
     # unet_encoder = UNet2DConditionModel_ref.from_pretrained(
     #     args.pretrained_model_name_or_path,
     #     subfolder="unet_encoder",
@@ -345,8 +352,6 @@ def main():
                         negative_prompt = [negative_prompt] * num_prompts
 
                     image_embeds = torch.cat(img_emb_list,dim=0)
-                    print(image_embeds.shape)
-
                     with torch.inference_mode():
                         (
                             prompt_embeds,

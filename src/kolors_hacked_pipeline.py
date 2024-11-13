@@ -462,9 +462,6 @@ class KolorsInpaintPipeline(
 
         image = image.to(device=device, dtype=dtype)
         if output_hidden_states:
-            print(self.image_encoder.config)
-            print(image.shape)
-
             image_enc_hidden_states = self.image_encoder(image, output_hidden_states=True).hidden_states[-2]
             image_enc_hidden_states = image_enc_hidden_states.repeat_interleave(num_images_per_prompt, dim=0)
             uncond_image_enc_hidden_states = self.image_encoder(
@@ -1037,14 +1034,10 @@ class KolorsInpaintPipeline(
             add_time_ids = list(original_size + crops_coords_top_left + target_size)
             add_neg_time_ids = list(negative_original_size + crops_coords_top_left + negative_target_size)
 
-        print(self.unet.config.addition_time_embed_dim)
-        print(len(add_time_ids))
-        print(text_encoder_projection_dim)
         passed_add_embed_dim = (
-            self.unet.config.addition_time_embed_dim * len(add_time_ids) + text_encoder_projection_dim
+            self.unet.config.addition_time_embed_dim * len(add_time_ids) + 4096
         )
         expected_add_embed_dim = self.unet.add_embedding.linear_1.in_features
-        print(expected_add_embed_dim)
 
         if (
             expected_add_embed_dim > passed_add_embed_dim
@@ -1703,7 +1696,6 @@ class KolorsInpaintPipeline(
         if negative_target_size is None:
             negative_target_size = target_size
 
-        print("before add text embeds")
         add_text_embeds = pooled_prompt_embeds
         if self.text_encoder_2 is None:
             text_encoder_projection_dim = int(pooled_prompt_embeds.shape[-1])
@@ -1743,11 +1735,8 @@ class KolorsInpaintPipeline(
                 self.do_classifier_free_guidance,
             )
 
-            print(image_embeds.shape)
-            print(self.unet.config)
-
             # project outside for loop
-            image_embeds = self.unet.encoder_hid_proj(image_embeds).to(prompt_embeds.dtype)
+            # image_embeds = self.unet.encoder_hid_proj(image_embeds).to(prompt_embeds.dtype)
 
 
         # 11. Denoising loop
@@ -1816,7 +1805,6 @@ class KolorsInpaintPipeline(
                 if self.do_classifier_free_guidance:
                     reference_features = [torch.cat([torch.zeros_like(d), d]) for d in reference_features]
 
-                print("before unet")
                 noise_pred = self.unet(
                     latent_model_input,
                     t,
