@@ -241,7 +241,7 @@ def main():
         f'{root_dir}/weights/Kolors-Inpainting/text_encoder',
         torch_dtype=torch.float16)
     tokenizer = ChatGLMTokenizer.from_pretrained(f'{root_dir}/weights/Kolors-Inpainting/text_encoder')
-    vae = AutoencoderKL.from_pretrained(f"{root_dir}/weights/Kolors-Inpainting", revision=None, torch_dtype=torch.float16)
+    vae = AutoencoderKL.from_pretrained(f"{root_dir}/weights/Kolors-Inpainting/vae", revision=None, torch_dtype=torch.float16)
     scheduler = EulerDiscreteScheduler.from_pretrained(f"{root_dir}/weights/Kolors-Inpainting/scheduler")
 
     image_encoder = CLIPVisionModelWithProjection.from_pretrained(

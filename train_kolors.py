@@ -10,12 +10,15 @@ from PIL import Image
 from transformers import CLIPImageProcessor
 from accelerate import Accelerator
 from accelerate.utils import ProjectConfiguration
-from diffusers import AutoencoderKL, DDPMScheduler
+from diffusers import AutoencoderKL, DDPMScheduler, EulerDiscreteScheduler
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection, CLIPTextModelWithProjection
 
 from src.unet_hacked_tryon import UNet2DConditionModel
 from src.unet_hacked_garmnet import UNet2DConditionModel as UNet2DConditionModel_ref
-from src.tryon_pipeline import StableDiffusionXLInpaintPipeline as TryonPipeline
+
+from src.kolors.models.modeling_chatglm import ChatGLMModel
+from src.kolors.models.tokenization_chatglm import ChatGLMTokenizer
+from src.kolors_hacked_pipeline import KolorsInpaintPipeline as TryonPipeline
 
 from ip_adapter.ip_adapter import Resampler
 from diffusers.utils.import_utils import is_xformers_available
@@ -25,7 +28,8 @@ import math
 from tqdm.auto import tqdm
 from diffusers.training_utils import compute_snr
 import torchvision.transforms.functional as TF
-
+from torch.utils.tensorboard import SummaryWriter
+import numpy as np
 
 
 class VitonHDDataset(data.Dataset):
@@ -118,7 +122,8 @@ class VitonHDDataset(data.Dataset):
         self.c_names = c_names
         self.dataroot_names = dataroot_names
         self.flip_transform = transforms.RandomHorizontalFlip(p=1)
-        self.clip_processor = CLIPImageProcessor()
+        self.clip_processor = CLIPImageProcessor(size=336, crop_size=336)
+
     def __getitem__(self, index):
         c_name = self.c_names[index]
         im_name = self.im_names[index]
@@ -255,10 +260,10 @@ class VitonHDDataset(data.Dataset):
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument("--pretrained_model_name_or_path",type=str,default="diffusers/stable-diffusion-xl-1.0-inpainting-0.1",required=False,help="Path to pretrained model or model identifier from huggingface.co/models.",)
-    parser.add_argument("--pretrained_garmentnet_path",type=str,default="stabilityai/stable-diffusion-xl-base-1.0",required=False,help="Path to pretrained model or model identifier from huggingface.co/models.",)
+    #parser.add_argument("--pretrained_garmentnet_path",type=str,default="stabilityai/stable-diffusion-xl-base-1.0",required=False,help="Path to pretrained model or model identifier from huggingface.co/models.",)
     parser.add_argument("--checkpointing_epoch",type=int,default=10,help=("Save a checkpoint of the training state every X updates. These checkpoints are only suitable for resuming"" training using `--resume_from_checkpoint`."),)
     parser.add_argument("--pretrained_ip_adapter_path",type=str,default="ckpt/ip_adapter/ip-adapter-plus_sdxl_vit-h.bin",help="Path to pretrained ip adapter model. If not specified weights are initialized randomly.",)
-    parser.add_argument("--image_encoder_path",type=str,default="ckpt/image_encoder",required=False,help="Path to CLIP image encoder",)
+    #parser.add_argument("--image_encoder_path",type=str,default="ckpt/image_encoder",required=False,help="Path to CLIP image encoder",)
     parser.add_argument("--gradient_checkpointing",action="store_true",help="Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.",)
     parser.add_argument("--width",type=int,default=768,)
     parser.add_argument("--height",type=int,default=1024,)
@@ -299,9 +304,8 @@ def parse_args():
 
 
 def main():
-
-
     args = parse_args()
+    tb_writer = SummaryWriter(log_dir=os.path.join(args.output_dir, 'logs'))
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir)
     accelerator = Accelerator(
         mixed_precision=args.mixed_precision,
@@ -314,19 +318,37 @@ def main():
             os.makedirs(args.output_dir, exist_ok=True)
 
     # Load scheduler, tokenizer and models.
+    root_dir = "/home/swan/Desktop/goncalo/software/Kolors"
+    text_encoder = ChatGLMModel.from_pretrained(
+        f'{root_dir}/weights/Kolors-Inpainting/text_encoder',
+        torch_dtype=torch.float16)
+    tokenizer = ChatGLMTokenizer.from_pretrained(f'{root_dir}/weights/Kolors-Inpainting/text_encoder')
+    vae = AutoencoderKL.from_pretrained(f"{root_dir}/weights/Kolors-Inpainting/vae", revision=None,
+                                        torch_dtype=torch.float16)
+    scheduler = EulerDiscreteScheduler.from_pretrained(f"{root_dir}/weights/Kolors-Inpainting/scheduler")
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler",rescale_betas_zero_snr=True)
-    tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
-    text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder")
-    tokenizer_2 = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer_2")
-    text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder_2")
-    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path,subfolder="vae",torch_dtype=torch.float16,)
-    unet_encoder = UNet2DConditionModel_ref.from_pretrained(args.pretrained_garmentnet_path, subfolder="unet")
+
+    unet_encoder = UNet2DConditionModel_ref.from_pretrained(
+        f"{root_dir}/weights/Kolors/unet_encoder",
+        revision=None,
+        torch_dtype=torch.float16
+    )
     unet_encoder.config.addition_embed_type = None
     unet_encoder.config["addition_embed_type"] = None
-    image_encoder = CLIPVisionModelWithProjection.from_pretrained(args.image_encoder_path)
+    image_encoder = CLIPVisionModelWithProjection.from_pretrained(
+        f'{root_dir}/weights/Kolors-IP-Adapter-Plus/image_encoder',
+        ignore_mismatched_sizes=True,
+        torch_dtype=torch.float16
+    )
 
     #customize unet start
-    unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet",low_cpu_mem_usage=False, device_map=None)
+    unet = UNet2DConditionModel.from_pretrained(
+        f"{root_dir}/weights/Kolors-Inpainting/unet",
+        low_cpu_mem_usage=False,
+        device_map=None,
+        revision=None,
+        torch_dtype=torch.float16
+    )
     unet.config.encoder_hid_dim = image_encoder.config.hidden_size
     unet.config.encoder_hid_dim_type = "ip_image_proj"
     unet.config["encoder_hid_dim"] = image_encoder.config.hidden_size
@@ -351,7 +373,7 @@ def main():
         ff_mult=4,
     ).to(accelerator.device, dtype=torch.float32)
 
-    image_proj_model.load_state_dict(state_dict["image_proj"], strict=True)
+    #image_proj_model.load_state_dict(state_dict["image_proj"], strict=True)
     image_proj_model.requires_grad_(True)
 
     unet.encoder_hid_proj = image_proj_model
@@ -381,14 +403,12 @@ def main():
         weight_dtype = torch.bfloat16
     vae.to(accelerator.device) 
     text_encoder.to(accelerator.device, dtype=weight_dtype)
-    text_encoder_2.to(accelerator.device, dtype=weight_dtype)
     image_encoder.to(accelerator.device, dtype=weight_dtype)
     unet_encoder.to(accelerator.device, dtype=weight_dtype)
 
 
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
-    text_encoder_2.requires_grad_(False)
     image_encoder.requires_grad_(False)
     unet_encoder.requires_grad_(False)
     unet.requires_grad_(True)
@@ -498,11 +518,9 @@ def main():
                                     args.pretrained_model_name_or_path,
                                     unet=unwrapped_unet,
                                     vae= vae,
-                                    scheduler=noise_scheduler,
+                                    scheduler=scheduler,
                                     tokenizer=tokenizer,
-                                    tokenizer_2=tokenizer_2,
                                     text_encoder=text_encoder,
-                                    text_encoder_2=text_encoder_2,
                                     image_encoder=image_encoder,
                                     unet_encoder = unet_encoder,
                                     torch_dtype=torch.float16,
@@ -587,7 +605,19 @@ def main():
                                             )[0]
 
                                         for i in range(len(images)):
-                                            images[i].save(os.path.join(args.output_dir,str(global_step)+"_"+str(i)+"_"+"test.jpg"))                                    
+                                            images[i].save(os.path.join(args.output_dir,str(global_step)+"_"+str(i)+"_"+"test.jpg"))
+
+                                            image_tensor = torch.tensor(np.array(images[i])).permute(2, 0, 1) / 255.0  # Normalized and channel-first format
+                                            tb_writer.add_image(f"Generated Image/{global_step}_{i}", image_tensor, global_step)
+
+                                            for key, value in {
+                                                "garment": sample["cloth_pure"],
+                                                "model": sample['im_mask'],
+                                                "orig_img": sample['image'],
+                                                "pose_img": sample['pose_img'],
+                                            }.items():
+                                                tb_writer.add_image(f"{key}/{global_step}_{i}", value[i], global_step)
+                                            tb_writer.add_text(f"Prompt/{global_step}_{i}", prompt[i] if isinstance(prompt, list) else prompt, global_step)
                                         break
                         del unwrapped_unet
                         del newpipe                
@@ -620,8 +650,9 @@ def main():
 
                 bsz = model_input.shape[0]
                 timesteps = torch.randint(
-                        0, noise_scheduler.config.num_train_timesteps, (bsz,), device=model_input.device
-                    )
+                    0, noise_scheduler.config.num_train_timesteps, (bsz,), device=model_input.device
+                )
+                timesteps = timesteps.long()
                 # Add noise to the latents according to the noise magnitude at each timestep
                 noisy_latents = noise_scheduler.add_noise(model_input, noise, timesteps)
                 latent_model_input = torch.cat([noisy_latents, mask,masked_latents,pose_map], dim=1)
@@ -629,25 +660,16 @@ def main():
             
                 text_input_ids = tokenizer(
                     batch['caption'],
-                    max_length=tokenizer.model_max_length,
-                    padding="max_length",
-                    truncation=True,
-                    return_tensors="pt"
-                ).input_ids
-                text_input_ids_2 = tokenizer_2(
-                    batch['caption'],
-                    max_length=tokenizer_2.model_max_length,
+                    max_length=256,
                     padding="max_length",
                     truncation=True,
                     return_tensors="pt"
                 ).input_ids
 
                 encoder_output = text_encoder(text_input_ids.to(accelerator.device), output_hidden_states=True)
-                text_embeds = encoder_output.hidden_states[-2]
-                encoder_output_2 = text_encoder_2(text_input_ids_2.to(accelerator.device), output_hidden_states=True)
-                pooled_text_embeds = encoder_output_2[0]
-                text_embeds_2 = encoder_output_2.hidden_states[-2]
-                encoder_hidden_states = torch.concat([text_embeds, text_embeds_2], dim=-1) # concat
+                text_embeds = encoder_output.hidden_states[-2].permute(1,0,2)
+                pooled_text_embeds = encoder_output.hidden_states[-1][-1, :, :].clone()
+                encoder_hidden_states = torch.concat([text_embeds], dim=-1) # concat
 
 
                 def compute_time_ids(original_size, crops_coords_top_left = (0,0)):
@@ -669,8 +691,6 @@ def main():
                 image_embeds = torch.cat(img_emb_list,dim=0)
                 image_embeds = image_encoder(image_embeds, output_hidden_states=True).hidden_states[-2]
                 ip_tokens =image_proj_model(image_embeds)
-            
-
 
                 # add cond
                 unet_added_cond_kwargs = {"text_embeds": pooled_text_embeds, "time_ids": add_time_ids}
@@ -683,25 +703,15 @@ def main():
 
                 text_input_ids = tokenizer(
                     batch['caption_cloth'],
-                    max_length=tokenizer.model_max_length,
+                    max_length=256,
                     padding="max_length",
                     truncation=True,
                     return_tensors="pt"
                 ).input_ids
-                text_input_ids_2 = tokenizer_2(
-                    batch['caption_cloth'],
-                    max_length=tokenizer_2.model_max_length,
-                    padding="max_length",
-                    truncation=True,
-                    return_tensors="pt"
-                ).input_ids
-
             
                 encoder_output = text_encoder(text_input_ids.to(accelerator.device), output_hidden_states=True)
-                text_embeds_cloth = encoder_output.hidden_states[-2]
-                encoder_output_2 = text_encoder_2(text_input_ids_2.to(accelerator.device), output_hidden_states=True)
-                text_embeds_2_cloth = encoder_output_2.hidden_states[-2]
-                text_embeds_cloth = torch.concat([text_embeds_cloth, text_embeds_2_cloth], dim=-1) # concat
+                text_embeds_cloth = encoder_output.hidden_states[-2].permute(1,0,2)
+                text_embeds_cloth = torch.concat([text_embeds_cloth], dim=-1) # concat
 
 
                 down,reference_features = unet_encoder(cloth_values,timesteps, text_embeds_cloth,return_dict=False)
@@ -753,7 +763,6 @@ def main():
 
                 optimizer.step()
                 optimizer.zero_grad()
-                # Load scheduler, tokenizer and models.
                 progress_bar.update(1)
                 global_step += 1
             if accelerator.sync_gradients:
@@ -761,6 +770,12 @@ def main():
                 global_step += 1
                 accelerator.log({"train_loss": train_loss}, step=global_step)
                 train_loss = 0.0
+
+            # Log to TensorBoard at each logging step
+            if global_step % args.logging_steps == 0 and accelerator.is_main_process:
+                tb_writer.add_scalar("Loss/Train", train_loss, global_step)  # Log training loss
+                tb_writer.add_scalar("Learning_Rate", optimizer.param_groups[0]['lr'], global_step)  # Log learning rate
+
             logs = {"step_loss": loss.detach().item()}
             progress_bar.set_postfix(**logs)
 
@@ -777,11 +792,9 @@ def main():
                     args.pretrained_model_name_or_path,
                     unet=unwrapped_unet,
                     vae= vae,
-                    scheduler=noise_scheduler,
+                    scheduler=scheduler,
                     tokenizer=tokenizer,
-                    tokenizer_2=tokenizer_2,
                     text_encoder=text_encoder,
-                    text_encoder_2=text_encoder_2,
                     image_encoder=image_encoder,
                     unet_encoder=unet_encoder,
                     torch_dtype=torch.float16,
@@ -792,6 +805,7 @@ def main():
                 pipeline.save_pretrained(save_path)
                 del pipeline
 
-                
+    tb_writer.close()
+
 if __name__ == "__main__":
     main()    
