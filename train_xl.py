@@ -323,7 +323,7 @@ def main():
     unet_encoder = UNet2DConditionModel_ref.from_pretrained(args.pretrained_garmentnet_path, subfolder="unet")
     unet_encoder.config.addition_embed_type = None
     unet_encoder.config["addition_embed_type"] = None
-    image_encoder = CLIPVisionModelWithProjection.from_pretrained(args.image_encoder_path)
+    image_encoder = CLIPVisionModelWithProjection.from_pretrained("/home/swan/Desktop/goncalo/software/yves-idm", subfolder="image_encoder")
 
     #customize unet start
     unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet",low_cpu_mem_usage=False, device_map=None)

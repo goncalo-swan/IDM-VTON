@@ -43,6 +43,7 @@ from diffusers.models.embeddings import (
     TextTimeEmbedding,
     TimestepEmbedding,
     Timesteps,
+    IPAdapterPlusImageProjection,
 )
 from diffusers.models.embeddings import GLIGENTextBoundingboxProjection as PositionNet
 
@@ -59,7 +60,7 @@ from diffusers.models.resnet import Downsample2D, FirDownsample2D, FirUpsample2D
 from diffusers.models.transformer_2d import Transformer2DModel
 import math
 
-from ip_adapter.ip_adapter import Resampler
+#from ip_adapter.ip_adapter import Resampler
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -475,15 +476,15 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
             )
         elif encoder_hid_dim_type == "ip_image_proj":
             # Kandinsky 2.2
-            self.encoder_hid_proj = Resampler(
-                dim=1280,
+            self.encoder_hid_proj = IPAdapterPlusImageProjection(
+                hidden_dims=self.config.cross_attention_dim,
                 depth=4,
                 dim_head=64,
-                heads=20,
+                heads=12,
                 num_queries=16,
-                embedding_dim=encoder_hid_dim,
-                output_dim=self.config.cross_attention_dim,
-                ff_mult=4,
+                embed_dims=encoder_hid_dim,
+                output_dims=self.config.cross_attention_dim,
+                ffn_ratio=4,
             )
                                     
             

@@ -20,7 +20,9 @@ from src.kolors.models.modeling_chatglm import ChatGLMModel
 from src.kolors.models.tokenization_chatglm import ChatGLMTokenizer
 from src.kolors_hacked_pipeline import KolorsInpaintPipeline as TryonPipeline
 
-from ip_adapter.ip_adapter import Resampler
+#from ip_adapter.ip_adapter import Resampler
+from diffusers.models.embeddings import IPAdapterPlusImageProjection
+from diffusers.models.modeling_utils import load_model_dict_into_meta
 from diffusers.utils.import_utils import is_xformers_available
 from typing import Literal, Tuple,List
 import torch.utils.data as data
@@ -30,6 +32,7 @@ from diffusers.training_utils import compute_snr
 import torchvision.transforms.functional as TF
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
+from inference_dc import pil_to_tensor
 
 
 class VitonHDDataset(data.Dataset):
@@ -274,8 +277,8 @@ def parse_args():
     parser.add_argument("--num_tokens",type=int,default=16,help=("IP adapter token nums"),)
     parser.add_argument("--learning_rate",type=float,default=1e-5,help="Learning rate to use.",)
     parser.add_argument("--weight_decay", type=float, default=1e-2, help="Weight decay to use.")
-    parser.add_argument("--train_batch_size", type=int, default=6, help="Batch size (per device) for the training dataloader.")
-    parser.add_argument("--test_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader.")
+    parser.add_argument("--train_batch_size", type=int, default=1, help="Batch size (per device) for the training dataloader.")
+    parser.add_argument("--test_batch_size", type=int, default=1, help="Batch size (per device) for the training dataloader.")
     parser.add_argument("--num_train_epochs", type=int, default=130)
     parser.add_argument("--max_train_steps",type=int,default=None,help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",)
     parser.add_argument("--noise_offset", type=float, default=None, help="noise offset")
@@ -288,7 +291,7 @@ def parse_args():
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
     parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
     parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
-    parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
+    parser.add_argument("--adam_epsilon", type=float, default=1e-04, help="Epsilon value for the Adam optimizer")
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     parser.add_argument("--data_dir", type=str, default="/home/omnious/workspace/yisol/Dataset/VITON-HD/zalando", help="For distributed training: local_rank")
     
@@ -323,7 +326,7 @@ def main():
         f'{root_dir}/weights/Kolors-Inpainting/text_encoder',
         torch_dtype=torch.float16)
     tokenizer = ChatGLMTokenizer.from_pretrained(f'{root_dir}/weights/Kolors-Inpainting/text_encoder')
-    vae = AutoencoderKL.from_pretrained(f"{root_dir}/weights/Kolors-Inpainting/vae", revision=None,
+    vae = AutoencoderKL.from_pretrained(f"/home/swan/Desktop/goncalo/software/yves-idm/vae", revision=None,
                                         torch_dtype=torch.float16)
     scheduler = EulerDiscreteScheduler.from_pretrained(f"{root_dir}/weights/Kolors-Inpainting/scheduler")
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler",rescale_betas_zero_snr=True)
@@ -355,25 +358,46 @@ def main():
     unet.config["encoder_hid_dim_type"] = "ip_image_proj"
 
 
-    state_dict = torch.load(args.pretrained_ip_adapter_path, map_location="cpu")
- 
- 
+    state_dict = torch.load(f'{root_dir}/weights/Kolors-IP-Adapter-Plus/ip_adapter_plus_general.bin', map_location="cpu")
     adapter_modules = torch.nn.ModuleList(unet.attn_processors.values())
-    adapter_modules.load_state_dict(state_dict["ip_adapter"],strict=True)
+    attn_procs = unet._convert_ip_adapter_attn_to_diffusers([state_dict], low_cpu_mem_usage=False)
+    unet.set_attn_processor(attn_procs)
 
     #ip-adapter
-    image_proj_model = Resampler(
-        dim=image_encoder.config.hidden_size,
+    image_proj_model = IPAdapterPlusImageProjection(
+        hidden_dims=unet.config.cross_attention_dim,
         depth=4,
         dim_head=64,
-        heads=20,
+        heads=12,
         num_queries=args.num_tokens,
-        embedding_dim=image_encoder.config.hidden_size,
-        output_dim=unet.config.cross_attention_dim,
-        ff_mult=4,
+        embed_dims=image_encoder.config.hidden_size,
+        output_dims=unet.config.cross_attention_dim,
+        ffn_ratio=4,
     ).to(accelerator.device, dtype=torch.float32)
 
-    #image_proj_model.load_state_dict(state_dict["image_proj"], strict=True)
+    state_dict = state_dict["image_proj"]
+    updated_state_dict = {}
+    for key, value in state_dict.items():
+        diffusers_name = key.replace("0.to", "2.to")
+        diffusers_name = diffusers_name.replace("1.0.weight", "3.0.weight")
+        diffusers_name = diffusers_name.replace("1.0.bias", "3.0.bias")
+        diffusers_name = diffusers_name.replace("1.1.weight", "3.1.net.0.proj.weight")
+        diffusers_name = diffusers_name.replace("1.3.weight", "3.1.net.2.weight")
+
+        if "norm1" in diffusers_name:
+            updated_state_dict[diffusers_name.replace("0.norm1", "0")] = value
+        elif "norm2" in diffusers_name:
+            updated_state_dict[diffusers_name.replace("0.norm2", "1")] = value
+        elif "to_kv" in diffusers_name:
+            v_chunk = value.chunk(2, dim=0)
+            updated_state_dict[diffusers_name.replace("to_kv", "to_k")] = v_chunk[0]
+            updated_state_dict[diffusers_name.replace("to_kv", "to_v")] = v_chunk[1]
+        elif "to_out" in diffusers_name:
+            updated_state_dict[diffusers_name.replace("to_out", "to_out.0")] = value
+        else:
+            updated_state_dict[diffusers_name] = value
+
+    image_proj_model.load_state_dict(updated_state_dict)
     image_proj_model.requires_grad_(True)
 
     unet.encoder_hid_proj = image_proj_model
@@ -528,7 +552,7 @@ def main():
                                     safety_checker=None,
                                 ).to(accelerator.device)
                                 with torch.no_grad():
-                                    for sample in test_dataloader:
+                                    for no_sample, sample in enumerate(test_dataloader):
                                         img_emb_list = []
                                         for i in range(sample['cloth'].shape[0]):
                                             img_emb_list.append(sample['cloth'][i])
@@ -606,19 +630,16 @@ def main():
 
                                         for i in range(len(images)):
                                             images[i].save(os.path.join(args.output_dir,str(global_step)+"_"+str(i)+"_"+"test.jpg"))
+                                            image_tensor = pil_to_tensor(images[i]).to('cuda') * 2.0 - 1.0
+                                            cloth_pure = sample["cloth_pure"][i].to('cuda')
+                                            image = sample["image"][i].to('cuda')
+                                            im_mask = sample["im_mask"][i].to('cuda')
+                                            pose_img = sample["pose_img"][i].to('cuda')
+                                            combine = torch.cat([cloth_pure, image, im_mask, pose_img, image_tensor], 2).squeeze()
+                                            tb_writer.add_image(f"combine_{no_sample}", (combine + 1) / 2.0, global_step)
 
-                                            image_tensor = torch.tensor(np.array(images[i])).permute(2, 0, 1) / 255.0  # Normalized and channel-first format
-                                            tb_writer.add_image(f"Generated Image/{global_step}_{i}", image_tensor, global_step)
-
-                                            for key, value in {
-                                                "garment": sample["cloth_pure"],
-                                                "model": sample['im_mask'],
-                                                "orig_img": sample['image'],
-                                                "pose_img": sample['pose_img'],
-                                            }.items():
-                                                tb_writer.add_image(f"{key}/{global_step}_{i}", value[i], global_step)
-                                            tb_writer.add_text(f"Prompt/{global_step}_{i}", prompt[i] if isinstance(prompt, list) else prompt, global_step)
-                                        break
+                                        if no_sample == 5:
+                                            break
                         del unwrapped_unet
                         del newpipe                
                         torch.cuda.empty_cache()
@@ -754,7 +775,6 @@ def main():
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
-                
                 # Backpropagate
                 accelerator.backward(loss)
 
@@ -764,7 +784,13 @@ def main():
                 optimizer.step()
                 optimizer.zero_grad()
                 progress_bar.update(1)
+
+                # Log to TensorBoard at each logging step
+                if global_step % args.logging_steps == 0 and accelerator.is_main_process:
+                    tb_writer.add_scalar("train_loss", avg_loss, global_step)  # Log training loss
+
                 global_step += 1
+
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
@@ -773,8 +799,7 @@ def main():
 
             # Log to TensorBoard at each logging step
             if global_step % args.logging_steps == 0 and accelerator.is_main_process:
-                tb_writer.add_scalar("Loss/Train", train_loss, global_step)  # Log training loss
-                tb_writer.add_scalar("Learning_Rate", optimizer.param_groups[0]['lr'], global_step)  # Log learning rate
+                tb_writer.add_scalar("train_loss", train_loss, global_step)  # Log training loss
 
             logs = {"step_loss": loss.detach().item()}
             progress_bar.set_postfix(**logs)
